@@ -9,9 +9,19 @@ CONFIG = YAML.load_file('./secrets/secrets.yml')
 date = Date.today-2
 
 file_date = date.strftime("%Y%m")
-csv_file_name = "reviews_#{CONFIG["package_name"]}_#{file_date}.csv"
+reviews_directory = "reviews/"
+  csv_file_list = Array.new
 
-system "BOTO_PATH=./secrets/.boto gsutil/gsutil cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} ."
+
+package_list = CONFIG["package_list"]
+package_list.each do |package_name|
+   csv_file_list <<  csv_file_name = "reviews_#{package_name}_#{file_date}.csv"
+   system "BOTO_PATH=./secrets/.boto gsutil/gsutil cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} #{reviews_directory}"
+ end
+
+# Commented to handle multiple packages (many apps)
+##csv_file_name = "reviews_#{CONFIG["package_name"]}_#{file_date}.csv"
+##system "BOTO_PATH=./secrets/.boto gsutil/gsutil cp -r gs://#{CONFIG["app_repo"]}/reviews/#{csv_file_name} reviews"
 
 
 class Slack
@@ -88,20 +98,22 @@ class Review
   end
 end
 
-CSV.foreach(csv_file_name, encoding: 'bom|utf-16le', headers: true) do |row|
-  # If there is no reply - push this review
-  if row[11].nil?
-    Review.collection << Review.new({
-      text: row[10],
-      title: row[9],
-      submitted_at: row[6],
-      edited: (row[4] != row[6]),
-      original_subitted_at: row[4],
-      rate: row[8],
-      device: row[3],
-      url: row[14],
-      version: row[1],
-    })
+csv_file_list.each do |csv_file_name|
+  CSV.foreach("#{reviews_directory}#{csv_file_name}", encoding: 'bom|utf-16le', headers: true) do |row|
+    # If there is no reply - push this review
+    if row[11].nil?
+      Review.collection << Review.new({
+        text: row[10],
+        title: row[9],
+        submitted_at: row[6],
+        edited: (row[4] != row[6]),
+        original_subitted_at: row[4],
+        rate: row[8],
+        device: row[3],
+        url: row[14],
+        version: row[1],
+      })
+    end
   end
 end
 
