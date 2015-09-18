@@ -23,8 +23,6 @@ import traceback
 
 from gslib import copy_helper
 from gslib.cat_helper import CatHelper
-from gslib.cloud_api import AccessDeniedException
-from gslib.cloud_api import NotFoundException
 from gslib.command import Command
 from gslib.command_argument import CommandArgument
 from gslib.commands.compose import MAX_COMPONENT_COUNT
@@ -32,6 +30,7 @@ from gslib.copy_helper import CreateCopyHelperOpts
 from gslib.copy_helper import ItemExistsError
 from gslib.copy_helper import Manifest
 from gslib.copy_helper import PARALLEL_UPLOAD_TEMP_NAMESPACE
+from gslib.copy_helper import SkipUnsupportedObjectError
 from gslib.cs_api_map import ApiSelector
 from gslib.exception import CommandException
 from gslib.name_expansion import NameExpansionIterator
@@ -50,9 +49,11 @@ _SYNOPSIS = """
   gsutil cp [OPTION]... -I dst_url
 """
 
-SYNOPSIS_TEXT = '<B>SYNOPSIS</B>\n' + _SYNOPSIS
+_SYNOPSIS_TEXT = """
+<B>SYNOPSIS</B>
+""" + _SYNOPSIS
 
-DESCRIPTION_TEXT = """
+_DESCRIPTION_TEXT = """
 <B>DESCRIPTION</B>
   The gsutil cp command allows you to copy data between your local file
   system and the cloud, copy data within the cloud, and copy data between
@@ -90,7 +91,7 @@ DESCRIPTION_TEXT = """
   and cloud URLs.
 """
 
-NAME_CONSTRUCTION_TEXT = """
+_NAME_CONSTRUCTION_TEXT = """
 <B>HOW NAMES ARE CONSTRUCTED</B>
   The gsutil cp command strives to name objects in a way consistent with how
   Linux cp works, which causes names to be constructed in varying ways depending
@@ -142,7 +143,7 @@ NAME_CONSTRUCTION_TEXT = """
   need to be able to download such objects using gsutil).
 """
 
-SUBDIRECTORIES_TEXT = """
+_SUBDIRECTORIES_TEXT = """
 <B>COPYING TO/FROM SUBDIRECTORIES; DISTRIBUTING TRANSFERS ACROSS MACHINES</B>
   You can use gsutil to copy to and from subdirectories by using a command
   like:
@@ -183,7 +184,7 @@ SUBDIRECTORIES_TEXT = """
   you experiment and find out what works best for you.
 """
 
-COPY_IN_CLOUD_TEXT = """
+_COPY_IN_CLOUD_TEXT = """
 <B>COPYING IN THE CLOUD AND METADATA PRESERVATION</B>
   If both the source and destination URL are cloud URLs from the same
   provider, gsutil copies data "in the cloud" (i.e., without downloading
@@ -195,28 +196,87 @@ COPY_IN_CLOUD_TEXT = """
   or re-create that metadata, downloading to a file will not retain the
   metadata.
 
+  Copies spanning locations and/or storage classes cause data to be rewritten
+  in the cloud, which may take some time. Such operations can be resumed with
+  the same command if they are interrupted, so long as the command parameters
+  are identical. 
+
   Note that by default, the gsutil cp command does not copy the object
   ACL to the new object, and instead will use the default bucket ACL (see
   "gsutil help defacl").  You can override this behavior with the -p
   option (see OPTIONS below).
 
   One additional note about copying in the cloud: If the destination bucket has
-  versioning enabled, gsutil cp will copy all versions of the source object(s).
-  For example:
+  versioning enabled, gsutil cp will by default copy only live versions of the
+  source object(s). For example:
 
     gsutil cp gs://bucket1/obj gs://bucket2
 
-  will cause all versions of gs://bucket1/obj to be copied to gs://bucket2.
+  will cause only the single live version of of gs://bucket1/obj to be copied
+  to gs://bucket2, even if there are archived versions of gs://bucket1/obj. To
+  also copy archived versions, use the -A flag:
+
+    gsutil cp -A gs://bucket1/obj gs://bucket2
+
+  The gsutil -m flag is disallowed when using the cp -A flag, to ensure that
+  version ordering is preserved.
 """
 
-FAILURE_HANDLING_TEXT = """
-<B>CHECKSUM VALIDATION AND FAILURE HANDLING</B>
-  At the end of every upload or download, the gsutil cp command validates that
-  that the checksum of the source file/object matches the checksum of the
-  destination file/object. If the checksums do not match, gsutil will delete
-  the invalid copy and print a warning message. This very rarely happens, but
+_CHECKSUM_VALIDATION_TEXT = """
+<B>CHECKSUM VALIDATION</B>
+  At the end of every upload or download the gsutil cp command validates that
+  the checksum it computes for the source file/object matches the checksum
+  the service computes. If the checksums do not match, gsutil will delete the
+  corrupted object and print a warning message. This very rarely happens, but
   if it does, please contact gs-team@google.com.
 
+  If you know the MD5 of a file before uploading you can specify it in the
+  Content-MD5 header, which will cause the cloud storage service to reject the
+  upload if the MD5 doesn't match the value computed by the service. For
+  example:
+
+    % gsutil hash obj
+    Hashing     obj:
+    Hashes [base64] for obj:
+            Hash (crc32c):          lIMoIw==
+            Hash (md5):             VgyllJgiiaRAbyUUIqDMmw==
+
+    % gsutil -h Content-MD5:VgyllJgiiaRAbyUUIqDMmw== cp obj gs://your-bucket/obj
+    Copying file://obj [Content-Type=text/plain]...
+    Uploading   gs://your-bucket/obj:                                182 b/182 B
+
+    If the checksum didn't match the service would instead reject the upload and
+    gsutil would print a message like:
+
+    BadRequestException: 400 Provided MD5 hash "VgyllJgiiaRAbyUUIqDMmw=="
+    doesn't match calculated MD5 hash "7gyllJgiiaRAbyUUIqDMmw==".
+
+  Even if you don't do this gsutil will delete the object if the computed
+  checksum mismatches, but specifying the Content-MD5 header has three
+  advantages:
+
+      1. It prevents the corrupted object from becoming visible at all, whereas
+      otherwise it would be visible for 1-3 seconds before gsutil deletes it.
+
+      2. It will definitively prevent the corrupted object from being left in
+      the cloud, whereas the gsutil approach of deleting after the upload
+      completes could fail if (for example) the gsutil process gets ^C'd
+      between upload and deletion request.
+
+      3. It supports a customer-to-service integrity check handoff. For example,
+      if you have a content production pipeline that generates data to be
+      uploaded to the cloud along with checksums of that data, specifying the
+      MD5 computed by your content pipeline when you run gsutil cp will ensure
+      that the checksums match all the way through the process (e.g., detecting
+      if data gets corrupted on your local disk between the time it was written
+      by your content pipeline and the time it was uploaded to GCS).
+
+  Note: The Content-MD5 header is ignored for composite objects, because such
+  objects only have a CRC32C checksum.
+"""
+
+_RETRY_HANDLING_TEXT = """
+<B>RETRY HANDLING</B>
   The cp command will retry when failures occur, but if enough failures happen
   during a particular copy or delete operation the command will skip that object
   and move on. At the end of the copy run if any failures were not successfully
@@ -231,7 +291,7 @@ FAILURE_HANDLING_TEXT = """
   "gsutil help retries".
 """
 
-RESUMABLE_TRANSFERS_TEXT = """
+_RESUMABLE_TRANSFERS_TEXT = """
 <B>RESUMABLE TRANSFERS</B>
   gsutil automatically uses the Google Cloud Storage resumable upload feature
   whenever you use the cp command to upload an object that is larger than 2
@@ -245,18 +305,11 @@ RESUMABLE_TRANSFERS_TEXT = """
 
   Similarly, gsutil automatically performs resumable downloads (using HTTP
   standard Range GET operations) whenever you use the cp command, unless the
-  destination is a stream or null. In this case the partially downloaded file
-  will be visible as soon as it starts being written. Thus, before you attempt
-  to use any files downloaded by gsutil you should make sure the download
-  completed successfully, by checking the exit status from the gsutil command.
-  This can be done in a bash script, for example, by doing:
+  destination is a stream or null. In this case, a partially downloaded
+  temporary file will be visible in the destination directory. Upon completion,
+  the original file is deleted and overwritten with the downloaded contents.
 
-     gsutil cp gs://your-bucket/your-object ./local-file
-     if [ "$status" -ne "0" ] ; then
-       << Code that handles failures >>
-     fi
-
-  Resumable uploads and downloads store some state information in a file
+  Resumable uploads and downloads store some state information in a files
   in ~/.gsutil named by the destination object or file. If you attempt to
   resume a transfer from a machine with a different directory, the transfer
   will start over from scratch.
@@ -265,7 +318,7 @@ RESUMABLE_TRANSFERS_TEXT = """
   in production.
 """
 
-STREAMING_TRANSFERS_TEXT = """
+_STREAMING_TRANSFERS_TEXT = """
 <B>STREAMING TRANSFERS</B>
   Use '-' in place of src_url or dst_url to perform a streaming
   transfer. For example:
@@ -280,9 +333,39 @@ STREAMING_TRANSFERS_TEXT = """
   (say, more than 100 MiB) it is recommended to write the data to a local file
   and then copy that file to the cloud rather than streaming it (and similarly
   for large downloads).
+
+  WARNING: When performing streaming transfers gsutil does not compute a
+  checksum of the uploaded or downloaded data.  Therefore, we recommend that
+  users either perform their own validation of the data or use non-streaming
+  transfers (which perform integrity checking automatically).
 """
 
-PARALLEL_COMPOSITE_UPLOADS_TEXT = """
+_SLICED_OBJECT_DOWNLOADS_TEXT = """
+<B>SLICED OBJECT DOWNLOADS</B>
+  gsutil automatically uses HTTP Range GET requests to perform "sliced"
+  downloads in parallel for downloads of large objects. This means that, if
+  enabled, disk space for the temporary download destination file will be
+  pre-allocated and byte ranges (slices) within the file will be downloaded in
+  parallel. Once all slices have completed downloading, the temporary file will
+  be renamed to the destination file. No additional local disk space is
+  required for this operation.
+
+  This feature is only available for Google Cloud Storage objects because it
+  requires a fast composable checksum that can be used to verify the data
+  integrity of the slices. Thus, using sliced object downloads also requires a
+  compiled crcmod (see "gsutil help crcmod") on the machine performing the
+  download. If compiled crcmod is not available, normal download will instead
+  be used.
+
+  Note: since sliced object downloads cause multiple writes to occur at various
+  locations on disk, this can degrade performance for disks with slow seek
+  times, especially for large numbers of slices. While the default number of
+  slices is small to avoid this, sliced object download can be completely
+  disabled by setting the "sliced_object_download_threshold" variable in the
+  .boto config file to 0.
+"""
+
+_PARALLEL_COMPOSITE_UPLOADS_TEXT = """
 <B>PARALLEL COMPOSITE UPLOADS</B>
   gsutil can automatically use
   `object composition <https://developers.google.com/storage/docs/composite-objects>`_
@@ -293,27 +376,51 @@ PARALLEL_COMPOSITE_UPLOADS_TEXT = """
   the cloud will be deleted after successful composition. No additional local
   disk space is required for this operation.
 
-  If the "parallel_composite_upload_threshold" config value is not 0 (which
-  disbles the feature), any file whose size exceeds the specified size will
-  trigger a parallel composite upload. Note that at present parallel composite
-  uploads are disabled by default, because using composite objects requires a
-  compiled crcmod (see "gsutil help crcmod"), and for operating systems that
-  don't already have this package installed this makes gsutil harder to use.
-  Google is actively working with a number of the Linux distributions to get
-  crcmod included with the stock distribution. Once that is done we will
-  re-enable parallel composite uploads by default in gsutil.
+  Using parallel composite uploads presents a tradeoff between upload
+  performance and download configuration: If you enable parallel composite
+  uploads your uploads will run faster, but someone will need to install a
+  compiled crcmod (see "gsutil help crcmod") on every machine where objects are
+  downloaded by gsutil or other Python applications. For some distributions this
+  is easy (e.g., it comes pre-installed on MacOS), but in some cases users have
+  found it difficult. Because of this at present parallel composite uploads are
+  disabled by default. Google is actively working with a number of the Linux
+  distributions to get crcmod included with the stock distribution. Once that is
+  done we will re-enable parallel composite uploads by default in gsutil.
 
-  The ideal size of a component can also be set with the
-  "parallel_composite_upload_component_size" config variable. See the comments
-  in the .boto config file for details about how these values are used.
+  Parallel composite uploads should not be used with NEARLINE storage
+  class buckets, as doing this would incur an early deletion charge for each
+  component object.
 
-  If the transfer fails prior to composition, running the command again will
-  take advantage of resumable uploads for those components that failed, and
-  the component objects will be deleted after the first successful attempt.
-  Any temporary objects that were uploaded successfully before gsutil failed
-  will still exist until the upload is completed successfully. The temporary
-  objects will be named in the following fashion:
-  <random ID>%s<hash>
+  To try parallel composite uploads you can run the command:
+
+    gsutil -o GSUtil:parallel_composite_upload_threshold=150M cp bigfile gs://your-bucket
+
+  where bigfile is larger than 150 MiB. When you do this notice that the upload
+  progress indicator continuously updates for several different uploads at once
+  (corresponding to each of the sections of the file being uploaded in
+  parallel), until the parallel upload completes. If you then want to enable
+  parallel composite uploads for all of your future uploads (notwithstanding the
+  caveats mentioned earlier), you can uncomment and set the
+  "parallel_composite_upload_threshold" config value in your .boto configuration
+  file to this value.
+
+  Note that the crcmod problem only impacts downloads via Python applications
+  (such as gsutil). If any users who need to download the data using gsutil or
+  other Python applications can install crcmod, it makes sense to enable
+  parallel composite uploads (see above). For example, if you use gsutil to
+  upload video assets and those assets will only ever be served via a Java
+  application (there are efficient crc32c implementations available in Java), it
+  would make sense to enable parallel composite uploads on your machine.
+
+  If a parallel composite upload fails prior to composition, re-running the
+  gsutil command will take advantage of resumable uploads for those components
+  that failed, and the component objects will be deleted after the first
+  successful attempt. Any temporary objects that were uploaded successfully
+  before gsutil failed will still exist until the upload is completed
+  successfully. The temporary objects will be named in the following fashion:
+
+    <random ID>%s<hash>
+
   where <random ID> is some numerical value, and <hash> is an MD5 hash (not
   related to the hash of the contents of the file or object).
 
@@ -342,7 +449,9 @@ PARALLEL_COMPOSITE_UPLOADS_TEXT = """
   uploads for that transfer.
 
   Also note that an object uploaded using this feature will have a CRC32C hash,
-  but it will not have an MD5 hash. For details see 'gsutil help crc32c'.
+  but it will not have an MD5 hash (and because of that, requires users who
+  download the object to have crcmod installed, as noted earlier). For details
+  see 'gsutil help crc32c'.
 
   Note that this feature can be completely disabled by setting the
   "parallel_composite_upload_threshold" variable in the .boto config file to 0.
@@ -350,7 +459,7 @@ PARALLEL_COMPOSITE_UPLOADS_TEXT = """
        MAX_COMPONENT_COUNT)
 
 
-CHANGING_TEMP_DIRECTORIES_TEXT = """
+_CHANGING_TEMP_DIRECTORIES_TEXT = """
 <B>CHANGING TEMP DIRECTORIES</B>
   gsutil writes data to a temporary directory in several cases:
 
@@ -380,12 +489,17 @@ CHANGING_TEMP_DIRECTORIES_TEXT = """
   is not necessary after running the export command on Linux and MacOS.)
 """
 
-OPTIONS_TEXT = """
+_OPTIONS_TEXT = """
 <B>OPTIONS</B>
-  -a canned_acl   Sets named canned_acl when uploaded objects created. See
-                  'gsutil help acls' for further details.
+  -a canned_acl  Sets named canned_acl when uploaded objects created. See
+                 'gsutil help acls' for further details.
 
-  -c             If an error occurrs, continue to attempt to copy the remaining
+  -A             Copy all source versions from a source buckets/folders.
+                 If not set, only the live version of each source object is
+                 copied. Note: this option is only useful when the destination
+                 bucket has versioning enabled.
+
+  -c             If an error occurs, continue to attempt to copy the remaining
                  files. If any copies were unsuccessful, gsutil's exit status
                  will be non-zero even if this flag is set. This option is
                  implicitly set when running "gsutil -m cp...". Note: -c only
@@ -490,6 +604,10 @@ OPTIONS_TEXT = """
                  will cause gsutil to copy any objects at the current bucket
                  directory level, and skip any subdirectories.
 
+  -U             Skip objects with unsupported object types instead of failing.
+                 Unsupported object types are Amazon S3 Objects in the GLACIER
+                 storage class.
+
   -v             Requests that the version-specific URL for each uploaded object
                  be printed. Given this URL you can make future upload requests
                  that are safe in the face of concurrent updates, because Google
@@ -532,20 +650,22 @@ OPTIONS_TEXT = """
                  file.
 """
 
-_DETAILED_HELP_TEXT = '\n\n'.join([SYNOPSIS_TEXT,
-                                   DESCRIPTION_TEXT,
-                                   NAME_CONSTRUCTION_TEXT,
-                                   SUBDIRECTORIES_TEXT,
-                                   COPY_IN_CLOUD_TEXT,
-                                   FAILURE_HANDLING_TEXT,
-                                   RESUMABLE_TRANSFERS_TEXT,
-                                   STREAMING_TRANSFERS_TEXT,
-                                   PARALLEL_COMPOSITE_UPLOADS_TEXT,
-                                   CHANGING_TEMP_DIRECTORIES_TEXT,
-                                   OPTIONS_TEXT])
+_DETAILED_HELP_TEXT = '\n\n'.join([_SYNOPSIS_TEXT,
+                                   _DESCRIPTION_TEXT,
+                                   _NAME_CONSTRUCTION_TEXT,
+                                   _SUBDIRECTORIES_TEXT,
+                                   _COPY_IN_CLOUD_TEXT,
+                                   _CHECKSUM_VALIDATION_TEXT,
+                                   _RETRY_HANDLING_TEXT,
+                                   _RESUMABLE_TRANSFERS_TEXT,
+                                   _STREAMING_TRANSFERS_TEXT,
+                                   _SLICED_OBJECT_DOWNLOADS_TEXT,
+                                   _PARALLEL_COMPOSITE_UPLOADS_TEXT,
+                                   _CHANGING_TEMP_DIRECTORIES_TEXT,
+                                   _OPTIONS_TEXT])
 
 
-CP_SUB_ARGS = 'a:cDeIL:MNnprRtvz:'
+CP_SUB_ARGS = 'a:AcDeIL:MNnprRtUvz:'
 
 
 def _CopyFuncWrapper(cls, args, thread_state=None):
@@ -646,10 +766,8 @@ class CpCommand(Command):
     # (e.g., trying to download an object called "mydata/" where the local
     # directory "mydata" exists).
     if IsCloudSubdirPlaceholder(exp_src_url):
-      self.logger.info('Skipping cloud sub-directory placeholder object (%s) '
-                       'because such objects aren\'t needed in (and would '
-                       'interfere with) directories in the local file system',
-                       exp_src_url)
+      # We used to output the message 'Skipping cloud sub-directory placeholder
+      # object...' but we no longer do so because it caused customer confusion.
       return
 
     if copy_helper_opts.use_manifest and self.manifest.WasSuccessful(
@@ -703,7 +821,7 @@ class CpCommand(Command):
               self.logger, exp_src_url, dst_url, gsutil_api,
               self, _CopyExceptionHandler, allow_splitting=True,
               headers=self.headers, manifest=self.manifest,
-              gzip_exts=self.gzip_exts, test_method=self.test_method))
+              gzip_exts=self.gzip_exts))
       if copy_helper_opts.use_manifest:
         if md5:
           self.manifest.Set(exp_src_url.url_string, 'md5', md5)
@@ -718,6 +836,17 @@ class CpCommand(Command):
       self.logger.info(message)
       if copy_helper_opts.use_manifest:
         self.manifest.SetResult(exp_src_url.url_string, 0, 'skip', message)
+    except SkipUnsupportedObjectError, e:
+      message = ('Skipping item %s with unsupported object type %s' %
+                 (exp_src_url.url_string, e.unsupported_type))
+      self.logger.info(message)
+      if copy_helper_opts.use_manifest:
+        self.manifest.SetResult(exp_src_url.url_string, 0, 'skip', message)
+    except copy_helper.FileConcurrencySkipError, e:
+      self.logger.warn('Skipping copy of source URL %s because destination URL '
+                       '%s is already being copied by another gsutil process '
+                       'or thread (did you specify the same source URL twice?) '
+                       % (src_url, dst_url))
     except Exception, e:
       if (copy_helper_opts.no_clobber and
           copy_helper.IsNoClobberServerException(e)):
@@ -775,33 +904,11 @@ class CpCommand(Command):
         copy_helper.ExpandUrlToSingleBlr(self.args[-1], self.gsutil_api,
                                          self.debug, self.project_id))
 
-    # If the destination bucket has versioning enabled iterate with
-    # all_versions=True. That way we'll copy all versions if the source bucket
-    # is versioned; and by leaving all_versions=False if the destination bucket
-    # has versioning disabled we will avoid copying old versions all to the same
-    # un-versioned destination object.
-    all_versions = False
-    try:
-      bucket = self._GetBucketWithVersioningConfig(self.exp_dst_url)
-      if bucket and bucket.versioning and bucket.versioning.enabled:
-        all_versions = True
-    except AccessDeniedException:
-      # This happens (in the XML API only) if the user doesn't have OWNER access
-      # on the bucket (needed to check if versioning is enabled). In this case
-      # fall back to copying all versions (which can be inefficient for the
-      # reason noted in the comment above). We don't try to warn the user
-      # because that would result in false positive warnings (since we can't
-      # check if versioning is enabled on the destination bucket).
-      #
-      # For JSON, we will silently not return versioning if we don't have
-      # access.
-      all_versions = True
-
     name_expansion_iterator = NameExpansionIterator(
         self.command_name, self.debug,
         self.logger, self.gsutil_api, url_strs,
         self.recursion_requested or copy_helper_opts.perform_mv,
-        project_id=self.project_id, all_versions=all_versions,
+        project_id=self.project_id, all_versions=self.all_versions,
         continue_on_error=self.continue_on_error or self.parallel_operations)
 
     # Use a lock to ensure accurate statistics in the face of
@@ -851,7 +958,7 @@ class CpCommand(Command):
             self.total_bytes_transferred, self.total_elapsed_time,
             MakeHumanReadable(self.total_bytes_per_second))
     if self.op_failure_count:
-      plural_str = 's' if self.op_failure_count else ''
+      plural_str = 's' if self.op_failure_count > 1 else ''
       raise CommandException('%d file%s/object%s could not be transferred.' % (
           self.op_failure_count, plural_str, plural_str))
 
@@ -876,6 +983,10 @@ class CpCommand(Command):
     # Command class, so save in Command state rather than CopyHelperOpts.
     self.canned = None
 
+    self.all_versions = False
+
+    self.skip_unsupported_objects = False
+
     # Files matching these extensions should be gzipped before uploading.
     self.gzip_exts = []
 
@@ -889,6 +1000,8 @@ class CpCommand(Command):
         if o == '-a':
           canned_acl = a
           self.canned = True
+        if o == '-A':
+          self.all_versions = True
         if o == '-c':
           self.continue_on_error = True
         elif o == '-D':
@@ -916,6 +1029,8 @@ class CpCommand(Command):
           preserve_acl = True
         elif o == '-r' or o == '-R':
           self.recursion_requested = True
+        elif o == '-U':
+          self.skip_unsupported_objects = True
         elif o == '-v':
           print_ver = True
         elif o == '-z':
@@ -923,6 +1038,11 @@ class CpCommand(Command):
     if preserve_acl and canned_acl:
       raise CommandException(
           'Specifying both the -p and -a options together is invalid.')
+    if self.all_versions and self.parallel_operations:
+      raise CommandException(
+          'The gsutil -m option is not supported with the cp -A flag, to '
+          'ensure that object version ordering is preserved. Please re-run '
+          'the command without the -m option.')
     return CreateCopyHelperOpts(
         perform_mv=perform_mv,
         no_clobber=no_clobber,
@@ -932,34 +1052,5 @@ class CpCommand(Command):
         use_manifest=use_manifest,
         preserve_acl=preserve_acl,
         canned_acl=canned_acl,
+        skip_unsupported_objects=self.skip_unsupported_objects,
         test_callback_file=test_callback_file)
-
-  def _GetBucketWithVersioningConfig(self, exp_dst_url):
-    """Gets versioning config for a bucket and ensures that it exists.
-
-    Args:
-      exp_dst_url: Wildcard-expanded destination StorageUrl.
-
-    Raises:
-      AccessDeniedException: if there was a permissions problem accessing the
-                             bucket or its versioning config.
-      CommandException: if URL refers to a cloud bucket that does not exist.
-
-    Returns:
-      apitools Bucket with versioning configuration.
-    """
-    bucket = None
-    if exp_dst_url.IsCloudUrl() and exp_dst_url.IsBucket():
-      try:
-        bucket = self.gsutil_api.GetBucket(
-            exp_dst_url.bucket_name, provider=exp_dst_url.scheme,
-            fields=['versioning'])
-      except AccessDeniedException, e:
-        raise
-      except NotFoundException, e:
-        raise CommandException('Destination bucket %s does not exist.' %
-                               exp_dst_url)
-      except Exception, e:
-        raise CommandException('Error retrieving destination bucket %s: %s' %
-                               (exp_dst_url, e.message))
-      return bucket

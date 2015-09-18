@@ -1,3 +1,219 @@
+Release 4.15 (release date: 2015-09-08)
+=======================================
+Bug Fixes
+---------
+- Fixed an OverflowError in apitools that caused download
+  failures for large files on 32-bit machines.
+- Removed unnecessary sending of range headers for downloads when
+  using the XML API.
+- Fixed a bug that caused perfdiag to report extremely high throughput
+  when the -p flag was unspecified and exactly one of the -c or -k flags
+  were specified.
+- Fixed a ValueError that occurred on Python 2.6 with sliced object downloads.
+
+Other Changes
+-------------
+- HTTP connections for downloads and uploads in the JSON API are now
+  re-used per-thread.
+- When gsutil's automatic update feature prompts and the user
+  chooses to update, gsutil will now exit with status code 1 after
+  updating (because the original command was not executed).
+- The cp -A flag is disabled when using gsutil -m to ensure that
+  ordering is preserved when copying between versioned buckets.
+
+Release 4.14 (release date: 2015-08-24)
+=======================================
+New Features
+------------
+- Implemented Sliced Object Download feature.
+  This breaks up a single large object into multiple pieces and
+  downloads them in parallel, improving performance. The gsutil cp, mv
+  and rsync commands now use this by default when compiled crcmod
+  is available for performing fast end-to-end integrity checks.
+  If compiled crcmod is not available, normal object download will
+  be used. Sliced download can be used in conjunction with the global -m
+  flag for maximum performance to download multiple objects in
+  parallel while additionally slicing each object.
+  See the "SLICED OBJECT DOWNLOAD" section of "gsutil help cp" for
+  details.
+  Note: sliced download may cause performance degradation for disks
+  with very slow seek times. You can disable this feature by setting
+  sliced_object_download_threshold = 0 in your .boto configuration file.
+- Added rthru_file and wthru_file test modes to perfdiag, allowing
+  measurement of reads and writes from a disk. This also allows
+  measurement of transferring objects too large to fit in memory.
+  The size restriction of 20GiB has been lifted.
+- perfdiag now supports a -p flag to choose a parallelism strategy
+  (slice, fan, or both) when using multiple threads and/or processes.
+
+Bug Fixes
+---------
+- Fixed an IOError that could occur in apitools when acquiring credentials
+  using multiple threads and/or processes on Google Compute Engine.
+- Fixed a bug where rm -r would attempt to delete a nonexistent bucket.
+- Fixed a bug where a default object ACL could not be set or changed to empty.
+- Fixed a bug where cached credentials corresponding to an old account could
+  be used (for example, credentials associated with a prior .boto
+  configuration file).
+- Fixed a bug in apitools for retrieving byte ranges of size 1 (for example,
+  "cat -r 1-1 ...")
+- Fixed a bug that caused the main gsutil process to perform all work leaving
+  all gsutil child processes idle.
+- Fixed a bug that caused multiple threads not to be used when
+  multiprocessing was unavailable.
+- Fixed a bug that caused rsync to skip files that start with "." when the
+  -r option was not used.
+- Fixed a bug that caused rsync -C to bail out when it failed to read
+  a source file.
+- Fixed a bug where gsutil stat printed unwanted output to stderr.
+- Fixed a bug where a parallel composite upload could return a nonzero exit
+  code even though the upload completed successfully. This occurred if
+  temporary component deletion triggered a retry but the original request
+  succeeded.
+- Fixed a bug where gsutil would exit with code 0 when both running in
+  debug mode and encountering an unhandled exception.
+- Fixed a bug where gsutil would suggest using parallel composite uploads
+  multiple times.
+
+Other Changes
+-------------
+- Bucket removal is now supported even if billing is disabled for that bucket.
+- Refactored Windows installs to no longer use any multiprocessing module
+  functions, as gsutil has never supported multiple processes on Windows.
+  Multithreading is unaffected and still available on Windows.
+- All downloads are now written to a temporary file with a "_.gstmp" suffix
+  while the download is still in progress.
+- Re-hashing of existing bytes when resuming downloads now displays progress.
+- Reduced the total number of multiprocessing.Manager processes to two.
+- The rm command now correctly counts the number of objects that could
+  not be removed.
+- Increased the default retries to match the Google Cloud Storage SLA.
+  By default, gsutil will now retry 23 times with exponential backoff up
+  to 32 seconds, for a total timespan of ~10 minutes.
+- Improved bucket subdirectory checks to a single HTTP call. Detection of
+  _$folder$ placeholder objects is now eventually consistent.
+- Eliminated two unnecessary HTTP calls when performing uploads via
+  the cp, mv, or rsync commands.
+- Updated documentation for several topics including acl, cache-control,
+  crcmod, cp, mb, rsync, and subdirs.
+- Added a warning about using parallel composite upload with NEARLINE
+  storage-class buckets.
+
+Release 4.13 (release date: 2015-06-03)
+=======================================
+New Features
+------------
+- Added -U flag to cp and rsync commands to allow skipping of unsupported
+  object types.
+- Added support for Google Developer Shell credentials.
+
+Bug Fixes
+---------
+- Precondition headers (x-goog-if-...) are now respected for the setmeta
+  command.
+- Fixed an index out of range error that could occur with an empty
+  parallel composite upload tracker file.
+- The stat command outputs errors to stderr instead of stdout.
+- Fixed two possible sources of ResumableUploadStartOverException from
+  httplib2 and oauth2client.
+- Fixed a bug in the compose command where a missing source object resulted
+  in an error message claiming the destination object was missing.
+
+Other Changes
+-------------
+- Added a help section on throttling gsutil.
+- Resumable uploads will now start over if a PUT to the upload ID returns
+  an HTTP 404. Previously this behavior applied only to an HTTP 410.
+- XML API resumable uploads now retry on HTTP 429 errors, matching the
+  behavior of JSON API resumable uploads.
+- Improved response to process kill signals, reducing the likelihood of
+  leaving orphaned child processes and temporary files.
+- Bucket lifecycle configuration now works for S3.
+- Removed the deprecated setmeta -n option.
+
+
+Release 4.12 (release date: 2015-04-20)
+=======================================
+New Features
+------------
+- Added support for JSON-format service account private key files.
+- Added support for the Rewrite API (JSON API only). This is used for
+  all copies within the Google Cloud and supports copying objects across
+  storage classes and/or locations.
+
+Bug Fixes
+---------
+- Fixed a bug that could cause downloads to have a hash mismatch (and deletion
+  of the corrupted file) when resumed across process breaks via a tracker file.
+
+Other Changes
+-------------
+- Updated documentation and examples for several topics including
+  acl, cp, dev, signurl, stat, and wildcards.
+
+
+Release 4.11 (release date: 2015-03-10)
+=======================================
+New Features
+------------
+- Added Nearline storage class support to the mb command.
+
+Bug Fixes
+---------
+- Fixed a bug for streaming uploads that could occasionally cause a HTTP 410
+  from the service or a hash mismatch (and deletion of the corrutped file).
+- Fixed an OverflowError that occurred when uploading files > 4GiB on a 32-bit
+  operating system.
+
+Other Changes
+-------------
+- Added documentation around using the Content-MD5 header to extend integrity
+  checking to include checksums computed by a client-side content pipeline.
+
+
+Release 4.10 (release date: 2015-03-03)
+=======================================
+Bug Fixes
+---------
+- Fixed a bug that could cause undetected data corruption (preserving incorrect
+  data) if a streaming upload encountered a service error on non-8KiB-aligned
+  boundary.
+- Fixed a bug that caused downloads to be truncated if the connection broke,
+  resulting in a hash mismatch (and deletion of the corrupted file) for that
+  download.
+- Fixed a format string arguments error that occurred if a download exhausted
+  all retries.
+
+Other Changes
+-------------
+- The lifecycle command now accepts JSON input in the form of
+  "{ "lifecycle": { "rule" ..." in addition to "{ "rule": ...".
+- Improved access token expiry logic for GCE credentials.
+
+
+Release 4.9 (release date: 2015-02-13)
+=======================================
+New Features
+------------
+- When using the JSON API, the ch acl/defacl subcommand now supports
+  project groups via the -p flag. For details, see "gsutil help acl ch".
+
+Bug Fixes
+---------
+- Fixed a bug that caused daisy-chain copies (including cross-provider
+  copies) for files large than 100MiB to fail.
+- Fixed a bug that caused streaming uploads than ran for longer than
+  an hour to fail with HTTP 400s.
+- Fixed a bug where perfdiag would not properly clean up its test files.
+- Fixed a bug where using ls with the XML API could mistakenly report bucket
+  configuration as present.
+
+Other Changes
+-------------
+- Updated documentation for metadata, retries, security, and subdirs.
+- Tracker files are no longer written for small downloads.
+
+
 Release 4.8 (release date: 2015-01-23)
 =======================================
 New Features

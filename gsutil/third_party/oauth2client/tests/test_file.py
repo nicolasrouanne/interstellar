@@ -24,7 +24,6 @@ __author__ = 'jcgregorio@google.com (Joe Gregorio)'
 
 import copy
 import datetime
-import httplib2
 import json
 import os
 import pickle
@@ -32,14 +31,16 @@ import stat
 import tempfile
 import unittest
 
-from oauth2client import GOOGLE_TOKEN_URI
+from .http_mock import HttpMockSequence
+import six
+
 from oauth2client import file
 from oauth2client import locked_file
 from oauth2client import multistore_file
 from oauth2client import util
 from oauth2client.client import AccessTokenCredentials
-from oauth2client.client import AssertionCredentials
 from oauth2client.client import OAuth2Credentials
+from six.moves import http_client
 try:
   # Python2
   from future_builtins import oct
@@ -64,11 +65,12 @@ class OAuth2ClientFileTests(unittest.TestCase):
     except OSError:
       pass
 
-  def create_test_credentials(self, client_id='some_client_id'):
+  def create_test_credentials(self, client_id='some_client_id',
+                              expiration=None):
     access_token = 'foo'
     client_secret = 'cOuDdkfjxxnv+'
     refresh_token = '1/0/a.df219fjls0'
-    token_expiry = datetime.datetime.utcnow()
+    token_expiry = expiration or datetime.datetime.utcnow()
     token_uri = 'https://www.google.com/accounts/o8/oauth2/token'
     user_agent = 'refresh_checker/1.0'
 
@@ -119,8 +121,57 @@ class OAuth2ClientFileTests(unittest.TestCase):
     self.assertEquals(data['_class'], 'OAuth2Credentials')
     self.assertEquals(data['_module'], OAuth2Credentials.__module__)
 
-  def test_token_refresh(self):
-    credentials = self.create_test_credentials()
+  def test_token_refresh_store_expired(self):
+    expiration = datetime.datetime.utcnow() - datetime.timedelta(minutes=15)
+    credentials = self.create_test_credentials(expiration=expiration)
+
+    s = file.Storage(FILENAME)
+    s.put(credentials)
+    credentials = s.get()
+    new_cred = copy.copy(credentials)
+    new_cred.access_token = 'bar'
+    s.put(new_cred)
+
+    access_token = '1/3w'
+    token_response = {'access_token': access_token, 'expires_in': 3600}
+    http = HttpMockSequence([
+        ({'status': '200'}, json.dumps(token_response).encode('utf-8')),
+    ])
+
+    credentials._refresh(http.request)
+    self.assertEquals(credentials.access_token, access_token)
+
+  def test_token_refresh_store_expires_soon(self):
+    # Tests the case where an access token that is valid when it is read from
+    # the store expires before the original request succeeds.
+    expiration = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    credentials = self.create_test_credentials(expiration=expiration)
+
+    s = file.Storage(FILENAME)
+    s.put(credentials)
+    credentials = s.get()
+    new_cred = copy.copy(credentials)
+    new_cred.access_token = 'bar'
+    s.put(new_cred)
+
+    access_token = '1/3w'
+    token_response = {'access_token': access_token, 'expires_in': 3600}
+    http = HttpMockSequence([
+        ({'status': str(http_client.UNAUTHORIZED)}, b'Initial token expired'),
+        ({'status': str(http_client.UNAUTHORIZED)}, b'Store token expired'),
+        ({'status': str(http_client.OK)},
+         json.dumps(token_response).encode('utf-8')),
+        ({'status': str(http_client.OK)},
+         b'Valid response to original request')
+    ])
+
+    credentials.authorize(http)
+    http.request('https://example.com')
+    self.assertEqual(credentials.access_token, access_token)
+
+  def test_token_refresh_good_store(self):
+    expiration = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    credentials = self.create_test_credentials(expiration=expiration)
 
     s = file.Storage(FILENAME)
     s.put(credentials)
@@ -131,6 +182,34 @@ class OAuth2ClientFileTests(unittest.TestCase):
 
     credentials._refresh(lambda x: x)
     self.assertEquals(credentials.access_token, 'bar')
+
+  def test_token_refresh_stream_body(self):
+    expiration = datetime.datetime.utcnow() + datetime.timedelta(minutes=15)
+    credentials = self.create_test_credentials(expiration=expiration)
+
+    s = file.Storage(FILENAME)
+    s.put(credentials)
+    credentials = s.get()
+    new_cred = copy.copy(credentials)
+    new_cred.access_token = 'bar'
+    s.put(new_cred)
+
+    valid_access_token = '1/3w'
+    token_response = {'access_token': valid_access_token, 'expires_in': 3600}
+    http = HttpMockSequence([
+        ({'status': str(http_client.UNAUTHORIZED)}, b'Initial token expired'),
+        ({'status': str(http_client.UNAUTHORIZED)}, b'Store token expired'),
+        ({'status': str(http_client.OK)},
+         json.dumps(token_response).encode('utf-8')),
+        ({'status': str(http_client.OK)}, 'echo_request_body')
+    ])
+
+    body = six.StringIO('streaming body')
+
+    credentials.authorize(http)
+    _, content = http.request('https://example.com', body=body)
+    self.assertEqual(content, 'streaming body')
+    self.assertEqual(credentials.access_token, valid_access_token)
 
   def test_credentials_delete(self):
     credentials = self.create_test_credentials()
@@ -286,7 +365,6 @@ class OAuth2ClientFileTests(unittest.TestCase):
     stored_credentials = store.get()
 
     self.assertEqual(credentials.access_token, stored_credentials.access_token)
-
 
   def test_multistore_file_get_all_keys(self):
     # start with no keys

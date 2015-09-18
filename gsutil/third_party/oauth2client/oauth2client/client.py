@@ -26,8 +26,11 @@ import datetime
 import json
 import logging
 import os
+import socket
 import sys
+import tempfile
 import time
+import shutil
 import six
 from six.moves import urllib
 
@@ -75,6 +78,11 @@ SERVICE_ACCOUNT = 'service_account'
 # The environment variable pointing the file with local
 # Application Default Credentials.
 GOOGLE_APPLICATION_CREDENTIALS = 'GOOGLE_APPLICATION_CREDENTIALS'
+# The ~/.config subdirectory containing gcloud credentials. Intended
+# to be swapped out in tests.
+_CLOUDSDK_CONFIG_DIRECTORY = 'gcloud'
+# The environment variable name which can replace ~/.config if set.
+_CLOUDSDK_CONFIG_ENV_VAR = 'CLOUDSDK_CONFIG'
 
 # The error message we show users when we can't find the Application
 # Default Credentials.
@@ -91,8 +99,12 @@ AccessTokenInfo = collections.namedtuple(
     'AccessTokenInfo', ['access_token', 'expires_in'])
 
 DEFAULT_ENV_NAME = 'UNKNOWN'
+
+# If set to True _get_environment avoid GCE check (_detect_gce_environment)
+NO_GCE_CHECK = os.environ.setdefault('NO_GCE_CHECK', 'False')
+
 class SETTINGS(object):
-  """Settings namespace for globally."""
+  """Settings namespace for globally defined values."""
   env_name = None
 
 
@@ -499,13 +511,13 @@ class OAuth2Credentials(Credentials):
     it.
 
     Args:
-       http: An instance of httplib2.Http
-         or something that acts like it.
+       http: An instance of ``httplib2.Http`` or something that acts
+         like it.
 
     Returns:
        A modified instance of http that was passed in.
 
-    Example:
+    Example::
 
       h = httplib2.Http()
       h = credentials.authorize(h)
@@ -515,6 +527,7 @@ class OAuth2Credentials(Credentials):
     signing. So instead we have to overload 'request' with a closure
     that adds in the Authorization header and then calls the original
     version of 'request()'.
+
     """
     request_orig = http.request
 
@@ -541,17 +554,31 @@ class OAuth2Credentials(Credentials):
         else:
           headers['user-agent'] = self.user_agent
 
+      body_stream_position = None
+      if all(getattr(body, stream_prop, None) for stream_prop in
+             ('read', 'seek', 'tell')):
+        body_stream_position = body.tell()
+
       resp, content = request_orig(uri, method, body, clean_headers(headers),
                                    redirections, connection_type)
 
-      if resp.status in REFRESH_STATUS_CODES:
-        logger.info('Refreshing due to a %s', resp.status)
+      # A stored token may expire between the time it is retrieved and the time
+      # the request is made, so we may need to try twice.
+      max_refresh_attempts = 2
+      for refresh_attempt in range(max_refresh_attempts):
+        if resp.status not in REFRESH_STATUS_CODES:
+          break
+        logger.info('Refreshing due to a %s (attempt %s/%s)', resp.status,
+                    refresh_attempt + 1, max_refresh_attempts)
         self._refresh(request_orig)
         self.apply(headers)
-        return request_orig(uri, method, body, clean_headers(headers),
-                            redirections, connection_type)
-      else:
-        return (resp, content)
+        if body_stream_position is not None:
+          body.seek(body_stream_position)
+
+        resp, content = request_orig(uri, method, body, clean_headers(headers),
+                                     redirections, connection_type)
+
+      return (resp, content)
 
     # Replace the request method with our own closure.
     http.request = new_request
@@ -744,8 +771,10 @@ class OAuth2Credentials(Credentials):
       self.store.acquire_lock()
       try:
         new_cred = self.store.locked_get()
+
         if (new_cred and not new_cred.invalid and
-            new_cred.access_token != self.access_token):
+            new_cred.access_token != self.access_token and
+            not new_cred.access_token_expired):
           logger.info('Updated access_token read from Storage')
           self._updateFromCredential(new_cred)
         else:
@@ -805,16 +834,16 @@ class OAuth2Credentials(Credentials):
       raise AccessTokenRefreshError(error_msg)
 
   def _revoke(self, http_request):
-    """Revokes the refresh_token and deletes the store if available.
+    """Revokes this credential and deletes the stored copy (if it exists).
 
     Args:
       http_request: callable, a callable that matches the method signature of
         httplib2.Http.request, used to make the revoke request.
     """
-    self._do_revoke(http_request, self.refresh_token)
+    self._do_revoke(http_request, self.refresh_token or self.access_token)
 
   def _do_revoke(self, http_request, token):
-    """Revokes the credentials and deletes the store if available.
+    """Revokes this credential and deletes the stored copy (if it exists).
 
     Args:
       http_request: callable, a callable that matches the method signature of
@@ -859,7 +888,8 @@ class AccessTokenCredentials(OAuth2Credentials):
 
   AccessTokenCredentials objects may be safely pickled and unpickled.
 
-  Usage:
+  Usage::
+
     credentials = AccessTokenCredentials('<an access token>',
       'my-user-agent/1.0')
     http = httplib2.Http()
@@ -928,12 +958,21 @@ def _detect_gce_environment(urlopen=None):
           Compute Engine.
   """
   urlopen = urlopen or urllib.request.urlopen
-
+  # Note: the explicit `timeout` below is a workaround. The underlying
+  # issue is that resolving an unknown host on some networks will take
+  # 20-30 seconds; making this timeout short fixes the issue, but
+  # could lead to false negatives in the event that we are on GCE, but
+  # the metadata resolution was particularly slow. The latter case is
+  # "unlikely".
   try:
-    response = urlopen('http://metadata.google.internal')
-    return any('Metadata-Flavor: Google' in header
-               for header in response.info().headers)
-  except urllib.error.URLError:
+    response = urlopen('http://169.254.169.254/', timeout=1)
+    return response.info().get('Metadata-Flavor', '') == 'Google'
+  except socket.timeout:
+    logger.info('Timeout attempting to reach GCE metadata service.')
+    return False
+  except urllib.error.URLError as e:
+    if isinstance(getattr(e, 'reason', None), socket.timeout):
+      logger.info('Timeout attempting to reach GCE metadata service.')
     return False
 
 
@@ -953,12 +992,19 @@ def _get_environment(urlopen=None):
   # None is an unset value, not the default.
   SETTINGS.env_name = DEFAULT_ENV_NAME
 
-  server_software = os.environ.get('SERVER_SOFTWARE', '')
-  if server_software.startswith('Google App Engine/'):
-    SETTINGS.env_name = 'GAE_PRODUCTION'
-  elif server_software.startswith('Development/'):
-    SETTINGS.env_name = 'GAE_LOCAL'
-  elif _detect_gce_environment(urlopen=urlopen):
+  try:
+    import google.appengine
+    has_gae_sdk = True
+  except ImportError:
+    has_gae_sdk = False
+
+  if has_gae_sdk:
+    server_software = os.environ.get('SERVER_SOFTWARE', '')
+    if server_software.startswith('Google App Engine/'):
+      SETTINGS.env_name = 'GAE_PRODUCTION'
+    elif server_software.startswith('Development/'):
+      SETTINGS.env_name = 'GAE_LOCAL'
+  elif NO_GCE_CHECK != 'True' and _detect_gce_environment(urlopen=urlopen):
     SETTINGS.env_name = 'GCE_PRODUCTION'
 
   return SETTINGS.env_name
@@ -1189,6 +1235,21 @@ class GoogleCredentials(OAuth2Credentials):
           'method should point to a file.')
 
 
+def _save_private_file(filename, json_contents):
+  """Saves a file with read-write permissions on for the owner.
+
+  Args:
+    filename: String. Absolute path to file.
+    json_contents: JSON serializable object to be saved.
+  """
+  temp_filename = tempfile.mktemp()
+  file_desc = os.open(temp_filename, os.O_WRONLY | os.O_CREAT, 0o600)
+  with os.fdopen(file_desc, 'w') as file_handle:
+    json.dump(json_contents, file_handle, sort_keys=True,
+              indent=2, separators=(',', ': '))
+  shutil.move(temp_filename, filename)
+
+
 def save_to_well_known_file(credentials, well_known_file=None):
   """Save the provided GoogleCredentials to the well known file.
 
@@ -1206,10 +1267,12 @@ def save_to_well_known_file(credentials, well_known_file=None):
   if well_known_file is None:
     well_known_file = _get_well_known_file()
 
-  credentials_data = credentials.serialization_data
+  config_dir = os.path.dirname(well_known_file)
+  if not os.path.isdir(config_dir):
+    raise OSError('Config directory does not exist: %s' % config_dir)
 
-  with open(well_known_file, 'w') as f:
-    json.dump(credentials_data, f, sort_keys=True, indent=2, separators=(',', ': '))
+  credentials_data = credentials.serialization_data
+  _save_private_file(well_known_file, credentials_data)
 
 
 def _get_environment_variable_file():
@@ -1233,25 +1296,24 @@ def _get_well_known_file():
   # of pinpointing the exact location of the file.
 
   WELL_KNOWN_CREDENTIALS_FILE = 'application_default_credentials.json'
-  CLOUDSDK_CONFIG_DIRECTORY = 'gcloud'
 
-  if os.name == 'nt':
-    try:
-      default_config_path = os.path.join(os.environ['APPDATA'],
-                                         CLOUDSDK_CONFIG_DIRECTORY)
-    except KeyError:
-      # This should never happen unless someone is really messing with things.
-      drive = os.environ.get('SystemDrive', 'C:')
-      default_config_path = os.path.join(drive, '\\', CLOUDSDK_CONFIG_DIRECTORY)
-  else:
-    default_config_path = os.path.join(os.path.expanduser('~'),
-                                       '.config',
-                                       CLOUDSDK_CONFIG_DIRECTORY)
+  default_config_dir = os.getenv(_CLOUDSDK_CONFIG_ENV_VAR)
+  if default_config_dir is None:
+    if os.name == 'nt':
+      try:
+        default_config_dir = os.path.join(os.environ['APPDATA'],
+                                          _CLOUDSDK_CONFIG_DIRECTORY)
+      except KeyError:
+        # This should never happen unless someone is really messing with things.
+        drive = os.environ.get('SystemDrive', 'C:')
+        default_config_dir = os.path.join(drive, '\\',
+                                          _CLOUDSDK_CONFIG_DIRECTORY)
+    else:
+      default_config_dir = os.path.join(os.path.expanduser('~'),
+                                        '.config',
+                                        _CLOUDSDK_CONFIG_DIRECTORY)
 
-  default_config_path = os.path.join(default_config_path,
-                                     WELL_KNOWN_CREDENTIALS_FILE)
-
-  return default_config_path
+  return os.path.join(default_config_dir, WELL_KNOWN_CREDENTIALS_FILE)
 
 
 def _get_application_default_credential_from_file(filename):
@@ -1604,7 +1666,7 @@ def credentials_from_code(client_id, client_secret, scope, code,
     client_id: string, client identifier.
     client_secret: string, client secret.
     scope: string or iterable of strings, scope(s) to request.
-    code: string, An authroization code, most likely passed down from
+    code: string, An authorization code, most likely passed down from
       the client
     redirect_uri: string, this is generally set to 'postmessage' to match the
       redirect_uri that the client specified
@@ -1688,8 +1750,8 @@ class DeviceFlowInfo(collections.namedtuple('DeviceFlowInfo', (
   def FromResponse(cls, response):
     """Create a DeviceFlowInfo from a server response.
 
-    The response should be a dict containing entries as described
-    here:
+    The response should be a dict containing entries as described here:
+
       http://tools.ietf.org/html/draft-ietf-oauth-v2-05#section-3.7.1
     """
     # device_code, user_code, and verification_url are required.

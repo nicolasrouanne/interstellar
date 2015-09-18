@@ -28,15 +28,16 @@ import re
 import time
 import urllib
 
+from apitools.base.py.exceptions import HttpError
+from apitools.base.py.http_wrapper import MakeRequest
+from apitools.base.py.http_wrapper import Request
+
 from gslib.command import Command
 from gslib.command_argument import CommandArgument
 from gslib.cs_api_map import ApiSelector
 from gslib.exception import CommandException
 from gslib.storage_url import ContainsWildcard
 from gslib.storage_url import StorageUrlFromString
-from gslib.third_party.storage_apitools.exceptions import HttpError
-from gslib.third_party.storage_apitools.http_wrapper import MakeRequest
-from gslib.third_party.storage_apitools.http_wrapper import Request
 from gslib.util import GetNewHttp
 from gslib.util import NO_MAX
 from gslib.util import UTF8
@@ -54,7 +55,7 @@ except ImportError:
 
 
 _SYNOPSIS = """
-  gsutil signurl pkcs12-file url...
+  gsutil signurl [-c] [-d] [-m] [-p] pkcs12-file url...
 """
 
 _DETAILED_HELP_TEXT = ("""
@@ -67,7 +68,7 @@ _DETAILED_HELP_TEXT = ("""
   the specified objects without authentication for a specific period of time.
 
   Please see the `Signed URLs documentation
-  https://developers.google.com/storage/docs/accesscontrol#Signed-URLs` for
+  <https://developers.google.com/storage/docs/accesscontrol#Signed-URLs>`_ for
   background about signed URLs.
 
   Multiple gs:// urls may be provided and may contain wildcards.  A signed url
@@ -86,7 +87,7 @@ _DETAILED_HELP_TEXT = ("""
   the private key file (default 'notasecret').  For more information
   regarding generating a private key for use with the signurl command please
   see the `Authentication documentation.
-  https://developers.google.com/storage/docs/authentication#generating-a-private-key`
+  <https://developers.google.com/storage/docs/authentication#generating-a-private-key>`_
 
   gsutil will look up information about the object "some-object/" (with a
   trailing slash) inside bucket "some-bucket", as opposed to operating on
@@ -116,17 +117,19 @@ _DETAILED_HELP_TEXT = ("""
 
   Create a signed url for downloading an object valid for 10 minutes:
 
-    gsutil signurl <private-key-file> -d 10m gs://<bucket>/<object>
+    gsutil signurl -d 10m <private-key-file> gs://<bucket>/<object>
 
   Create a signed url for uploading a plain text file via HTTP PUT:
 
-    gsutil signurl <private-key-file> -m PUT -d 1h -c text/plain gs://<bucket>/<obj>
+    gsutil signurl -m PUT -d 1h -c text/plain <private-key-file> \\
+        gs://<bucket>/<obj>
 
   To construct a signed URL that allows anyone in possession of
   the URL to PUT to the specified bucket for one day, creating
   any object of Content-Type image/jpg, run:
 
-    gsutil signurl <private-key-file> -m PUT -d 1d -c image/jpg gs://<bucket>/<obj>
+    gsutil signurl -m PUT -d 1d -c image/jpg <private-key-file> \\
+        gs://<bucket>/<obj>
 
 
 """)

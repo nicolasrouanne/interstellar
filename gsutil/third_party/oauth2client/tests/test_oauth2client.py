@@ -23,15 +23,15 @@ Unit tests for oauth2client.
 __author__ = 'jcgregorio@google.com (Joe Gregorio)'
 
 import base64
+import contextlib
 import datetime
 import json
-try:
-  from mox3 import mox
-except ImportError:
-  import mox
 import os
+import sys
 import time
 import unittest
+
+import mock
 import six
 from six.moves import urllib
 
@@ -140,7 +140,26 @@ class MockResponse(object):
       def __init__(self, headers):
         self.headers = headers
 
+      def get(self, key, default=None):
+        return self.headers.get(key, default)
+
     return Info(self._headers)
+
+
+@contextlib.contextmanager
+def mock_module_import(module):
+  """Place a dummy objects in sys.modules to mock an import test."""
+  parts = module.split('.')
+  entries = ['.'.join(parts[:i+1]) for i in range(len(parts))]
+  for entry in entries:
+    sys.modules[entry] = object()
+  
+  try:
+    yield
+
+  finally:
+    for entry in entries:
+      del sys.modules[entry]
 
 
 class GoogleCredentialsTests(unittest.TestCase):
@@ -199,46 +218,33 @@ class GoogleCredentialsTests(unittest.TestCase):
                      credentials.create_scoped(['dummy_scope']))
 
   def test_get_environment_gae_production(self):
-    os.environ['SERVER_SOFTWARE'] = 'Google App Engine/XYZ'
-    self.assertEqual('GAE_PRODUCTION', _get_environment())
+    with mock_module_import('google.appengine'):
+      os.environ['SERVER_SOFTWARE'] = 'Google App Engine/XYZ'
+      self.assertEqual('GAE_PRODUCTION', _get_environment())
 
   def test_get_environment_gae_local(self):
-    os.environ['SERVER_SOFTWARE'] = 'Development/XYZ'
-    self.assertEqual('GAE_LOCAL', _get_environment())
+    with mock_module_import('google.appengine'):
+      os.environ['SERVER_SOFTWARE'] = 'Development/XYZ'
+      self.assertEqual('GAE_LOCAL', _get_environment())
 
   def test_get_environment_gce_production(self):
     os.environ['SERVER_SOFTWARE'] = ''
-    mockResponse = MockResponse(['Metadata-Flavor: Google\r\n'])
-
-    m = mox.Mox()
-
-    urllib2_urlopen = m.CreateMock(object)
-    urllib2_urlopen.__call__(('http://metadata.google.internal'
-                             )).AndReturn(mockResponse)
-
-    m.ReplayAll()
-
-    self.assertEqual('GCE_PRODUCTION', _get_environment(urllib2_urlopen))
-
-    m.UnsetStubs()
-    m.VerifyAll()
+    response = MockResponse({'Metadata-Flavor': 'Google'})
+    with mock.patch.object(urllib.request, 'urlopen',
+                           return_value=response,
+                           autospec=True) as urlopen:
+      self.assertEqual('GCE_PRODUCTION', _get_environment())
+      urlopen.assert_called_once_with(
+          'http://169.254.169.254/', timeout=1)
 
   def test_get_environment_unknown(self):
     os.environ['SERVER_SOFTWARE'] = ''
-    mockResponse = MockResponse([])
-
-    m = mox.Mox()
-
-    urllib2_urlopen = m.CreateMock(object)
-    urllib2_urlopen.__call__(('http://metadata.google.internal'
-                             )).AndReturn(mockResponse)
-
-    m.ReplayAll()
-
-    self.assertEqual(DEFAULT_ENV_NAME, _get_environment(urllib2_urlopen))
-
-    m.UnsetStubs()
-    m.VerifyAll()
+    with mock.patch.object(urllib.request, 'urlopen',
+                           return_value=MockResponse({}),
+                           autospec=True) as urlopen:
+      self.assertEqual(DEFAULT_ENV_NAME, _get_environment())
+      urlopen.assert_called_once_with(
+          'http://169.254.169.254/', timeout=1)
 
   def test_get_environment_variable_file(self):
     environment_variable_file = datafile(
@@ -261,11 +267,32 @@ class GoogleCredentialsTests(unittest.TestCase):
                        str(error))
 
   def test_get_well_known_file_on_windows(self):
-    well_known_file = datafile(
-        os.path.join('gcloud', 'application_default_credentials.json'))
-    os.name = 'nt'
-    os.environ['APPDATA'] = DATA_DIR
-    self.assertEqual(well_known_file, _get_well_known_file())
+    ORIGINAL_ISDIR = os.path.isdir
+    try:
+      os.path.isdir = lambda path: True
+      well_known_file = datafile(
+          os.path.join(client._CLOUDSDK_CONFIG_DIRECTORY,
+                       'application_default_credentials.json'))
+      os.name = 'nt'
+      os.environ['APPDATA'] = DATA_DIR
+      self.assertEqual(well_known_file, _get_well_known_file())
+    finally:
+      os.path.isdir = ORIGINAL_ISDIR
+
+  def test_get_well_known_file_with_custom_config_dir(self):
+    ORIGINAL_ENVIRON = os.environ
+    ORIGINAL_ISDIR = os.path.isdir
+    CUSTOM_DIR = 'CUSTOM_DIR'
+    EXPECTED_FILE = os.path.join(CUSTOM_DIR,
+                                 'application_default_credentials.json')
+    try:
+      os.environ = {client._CLOUDSDK_CONFIG_ENV_VAR: CUSTOM_DIR}
+      os.path.isdir = lambda path: True
+      well_known_file = _get_well_known_file()
+      self.assertEqual(well_known_file, EXPECTED_FILE)
+    finally:
+      os.environ = ORIGINAL_ENVIRON
+      os.path.isdir = ORIGINAL_ISDIR
 
   def test_get_application_default_credential_from_file_service_account(self):
     credentials_file = datafile(
@@ -289,6 +316,18 @@ class GoogleCredentialsTests(unittest.TestCase):
     self.assertEqual('dummy@google.com', d['client_email'])
     self.assertEqual('ABCDEF', d['private_key_id'])
     os.remove(temp_credential_file)
+
+  def test_save_well_known_file_with_non_existent_config_dir(self):
+    credential_file = datafile(
+        os.path.join('gcloud', 'application_default_credentials.json'))
+    credentials = _get_application_default_credential_from_file(
+        credential_file)
+    ORIGINAL_ISDIR = os.path.isdir
+    try:
+      os.path.isdir = lambda path: False
+      self.assertRaises(OSError, save_to_well_known_file, credentials)
+    finally:
+      os.path.isdir = ORIGINAL_ISDIR
 
   def test_get_application_default_credential_from_file_authorized_user(self):
     credentials_file = datafile(
@@ -423,11 +462,18 @@ class GoogleCredentialsTests(unittest.TestCase):
     os.environ[GOOGLE_APPLICATION_CREDENTIALS] = ''
     os.environ['APPDATA'] = ''
     # we can't use self.assertRaisesRegexp() because it is only in Python 2.7+
+    VALID_CONFIG_DIR = client._CLOUDSDK_CONFIG_DIRECTORY
+    ORIGINAL_ISDIR = os.path.isdir
     try:
+      os.path.isdir = lambda path: True
+      client._CLOUDSDK_CONFIG_DIRECTORY = 'BOGUS_CONFIG_DIR'
       GoogleCredentials.get_application_default()
       self.fail('An exception was expected!')
     except ApplicationDefaultCredentialsError as error:
       self.assertEqual(ADC_HELP_MSG, str(error))
+    finally:
+      os.path.isdir = ORIGINAL_ISDIR
+      client._CLOUDSDK_CONFIG_DIRECTORY = VALID_CONFIG_DIR
 
   def test_from_stream_service_account(self):
     credentials_file = datafile(
@@ -573,6 +619,14 @@ class BasicCredentialsTests(unittest.TestCase):
     _token_revoke_test_helper(
         self, '400', revoke_raise=True,
         valid_bool_value=False, token_attr='refresh_token')
+
+  def test_token_revoke_fallback(self):
+    original_credentials = self.credentials.to_json()
+    self.credentials.refresh_token = None
+    _token_revoke_test_helper(
+        self, '200', revoke_raise=False,
+      valid_bool_value=True, token_attr='access_token')
+    self.credentials = self.credentials.from_json(original_credentials)
 
   def test_non_401_error_response(self):
     http = HttpMockSequence([
@@ -1112,6 +1166,36 @@ class MemoryCacheTests(unittest.TestCase):
     self.assertEqual('bar', m.get('foo'))
     m.delete('foo')
     self.assertEqual(None, m.get('foo'))
+
+
+class Test__save_private_file(unittest.TestCase):
+
+  def _save_helper(self, filename):
+    contents = []
+    contents_str = '[]'
+    client._save_private_file(filename, contents)
+    with open(filename, 'r') as f:
+      stored_contents = f.read()
+    self.assertEqual(stored_contents, contents_str)
+
+    stat_mode = os.stat(filename).st_mode
+    # Octal 777, only last 3 positions matter for permissions mask.
+    stat_mode &= 0o777
+    self.assertEqual(stat_mode, 0o600)
+
+  def test_new(self):
+    import tempfile
+    filename = tempfile.mktemp()
+    self.assertFalse(os.path.exists(filename))
+    self._save_helper(filename)
+
+  def test_existing(self):
+    import tempfile
+    filename = tempfile.mktemp()
+    with open(filename, 'w') as f:
+      f.write('a bunch of nonsense longer than []')
+    self.assertTrue(os.path.exists(filename))
+    self._save_helper(filename)
 
 
 if __name__ == '__main__':
