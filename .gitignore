@@ -1,4 +1,5 @@
 /secrets/secrets.yml
+/secrets/sectets.yml.bak
 /secrets/.boto
 .DS_Store
 *.csv
